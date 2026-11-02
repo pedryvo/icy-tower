@@ -4,8 +4,12 @@
 data/
 *.dat
 *.url
+readme.txt
 
 # Dependencies and build outputs
 node_modules/
 dist/
 .DS_Store
+re/
+tools/
+
