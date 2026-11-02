@@ -1,0 +1,11 @@
+# Original game binaries and proprietary archives
+*.exe
+*.dll
+data/
+*.dat
+*.url
+
+# Dependencies and build outputs
+node_modules/
+dist/
+.DS_Store
