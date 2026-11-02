@@ -46,7 +46,7 @@ typedef struct {
     float y;
     int tile_start;
     int tile_end;
-    int type; // 0: ice, 1: wood, 2: cloud, 3: bone, 4: vine
+    int type; // 0: ice, 1: wood, 2: cloud, 3: bone
 } Platform;
 
 typedef struct {
@@ -59,6 +59,7 @@ typedef struct {
     int spin;        // >0: spinning clockwise, <0: counter-clockwise, 0: normal
     float spin_angle;// rotation angle in radians
     int on_edge;     // 1 if balancing on platform edge
+    int current_plat_idx; // index of platform currently standing on (-1 if airborne)
     int anim_frame;
     int anim_timer;
 } Player;
@@ -146,7 +147,7 @@ static void generate_platforms_ahead(void) {
         
         int floor_num = g_game.next_floor_gen++;
         float plat_y = 400.0f - floor_num * 80.0f; // 80px distance between floors
-        int theme = (floor_num / 100) % 5;
+        int theme = (floor_num / 100) % 4;
         
         Platform* p = &g_game.platforms[slot];
         p->active = 1;
@@ -155,13 +156,11 @@ static void generate_platforms_ahead(void) {
         p->type = theme;
         
         if (floor_num == 0 || (floor_num % 50 == 0)) {
-            // Full width floor
+            // Full width floor (floor 0 and every 50 floors)
             p->tile_start = 5;
             p->tile_end = 35;
         } else {
             // Formula from FUN_00404ff0:
-            // length = rand() % max_len + 6
-            // start = rand() % (30 - length) + 5
             int max_len = 16 - min_f(floor_num / 50, 10);
             if (max_len < 6) max_len = 6;
             int length = (rand_next() % max_len) + 6;
@@ -176,26 +175,24 @@ static void generate_platforms_ahead(void) {
     }
 }
 
-// Check platform collision for player
-static Platform* check_platform_landing(float px, float py, float p_prev_y) {
-    if (g_game.player.vy <= 0.0f) return 0; // only land when moving down
-    
+// Find if falling player hits a platform
+static int find_landing_platform(float px, float py, float prev_py) {
     for (int i = 0; i < MAX_PLATFORMS; i++) {
         Platform* p = &g_game.platforms[i];
         if (!p->active) continue;
         
-        // Foot bounds: px - 11 to px + 11
         float plat_left = p->tile_start * TILE_SIZE;
         float plat_right = p->tile_end * TILE_SIZE;
         
+        // Foot horizontal contact: foot spans [px - 11, px + 11]
         if ((px + 11.0f >= plat_left) && (px - 11.0f <= plat_right)) {
-            // Check vertical crossing: previous foot was at or above platform Y, now at or below
-            if (p_prev_y <= p->y && py >= p->y - 2.0f && py <= p->y + 16.0f) {
-                return p;
+            // Foot was above or at platform on previous frame, and is at or slightly below platform now
+            if (prev_py <= p->y + 2.0f && py >= p->y - 4.0f && py <= p->y + 16.0f) {
+                return i;
             }
         }
     }
-    return 0;
+    return -1;
 }
 
 __attribute__((export_name("init_game")))
@@ -211,6 +208,7 @@ void init_game(unsigned int seed, int start_floor) {
     g_game.player.spin = 0;
     g_game.player.spin_angle = 0.0f;
     g_game.player.on_edge = 0;
+    g_game.player.current_plat_idx = 0;
     g_game.player.anim_frame = 0;
     g_game.player.anim_timer = 0;
     
@@ -278,6 +276,9 @@ void update_physics(int input_left, int input_right, int input_jump) {
     // 2. Jump handling (FUN_00406800 & FUN_00402610)
     if (input_jump && p->state == 0) {
         p->state = 1; // jumping up
+        p->current_plat_idx = -1;
+        p->on_edge = 0;
+        
         // Jump formula from Ghidra: vy = -max(12.0, abs(2 * vx))
         float jump_power = max_f(12.0f, abs_f(2.0f * p->vx));
         p->vy = -jump_power;
@@ -298,6 +299,8 @@ void update_physics(int input_left, int input_right, int input_jump) {
         if (p->state == 1 && p->vy > 0.0f) {
             p->state = 2; // falling down
         }
+    } else {
+        p->vy = 0.0f;
     }
     
     // Clamp vertical velocity: max fall speed 12.0
@@ -337,58 +340,86 @@ void update_physics(int input_left, int input_right, int input_jump) {
         p->spin_angle = 0.0f;
     }
     
-    // 6. Platform landing collision
-    Platform* landed = check_platform_landing(p->x, p->y, prev_y);
-    if (landed) {
-        p->y = landed->y;
-        p->vy = 0.0f;
-        p->state = 0; // on ground
-        p->spin = 0;
-        p->spin_angle = 0.0f;
-        trigger_sfx(SFX_STEP);
+    // 6. Platform support & landing collision
+    if (p->state == 0) {
+        // Player is currently on ground. Verify that platform still supports player!
+        int plat_idx = p->current_plat_idx;
+        int still_supported = 0;
+        if (plat_idx >= 0 && plat_idx < MAX_PLATFORMS && g_game.platforms[plat_idx].active) {
+            Platform* cur_p = &g_game.platforms[plat_idx];
+            float plat_left = cur_p->tile_start * TILE_SIZE;
+            float plat_right = cur_p->tile_end * TILE_SIZE;
+            
+            if ((p->x + 11.0f >= plat_left) && (p->x - 11.0f <= plat_right)) {
+                still_supported = 1;
+                p->y = cur_p->y; // Lock solidly to platform height
+                p->vy = 0.0f;
+                
+                // Edge wobble check
+                if (abs_f(p->x - plat_left) < 14.0f || abs_f(p->x - plat_right) < 14.0f) {
+                    if (!p->on_edge) {
+                        p->on_edge = 1;
+                        trigger_sfx(SFX_EDGE);
+                    }
+                } else {
+                    p->on_edge = 0;
+                }
+            }
+        }
         
-        int prev_floor = p->on_edge ? g_game.current_floor : g_game.current_floor;
-        int new_floor = landed->floor_num;
-        
-        // Edge wobble check
-        float plat_left = landed->tile_start * TILE_SIZE;
-        float plat_right = landed->tile_end * TILE_SIZE;
-        if (abs_f(p->x - plat_left) < 14.0f || abs_f(p->x - plat_right) < 14.0f) {
-            if (!p->on_edge) {
+        if (!still_supported) {
+            // Walked off the platform ledge!
+            p->state = 2; // start falling
+            p->current_plat_idx = -1;
+            p->on_edge = 0;
+        }
+    } else if (p->vy >= 0.0f) {
+        // Player is in air and descending (falling) -> check for platform landings
+        int landed_idx = find_landing_platform(p->x, p->y, prev_y);
+        if (landed_idx >= 0) {
+            Platform* landed = &g_game.platforms[landed_idx];
+            p->y = landed->y;
+            p->vy = 0.0f;
+            p->state = 0; // successfully landed
+            p->current_plat_idx = landed_idx;
+            p->spin = 0;
+            p->spin_angle = 0.0f;
+            trigger_sfx(SFX_STEP);
+            
+            int new_floor = landed->floor_num;
+            
+            // Edge wobble check
+            float plat_left = landed->tile_start * TILE_SIZE;
+            float plat_right = landed->tile_end * TILE_SIZE;
+            if (abs_f(p->x - plat_left) < 14.0f || abs_f(p->x - plat_right) < 14.0f) {
                 p->on_edge = 1;
                 trigger_sfx(SFX_EDGE);
-            }
-        } else {
-            p->on_edge = 0;
-        }
-        
-        // Combo evaluation (FUN_004034a0 & FUN_004024f0)
-        if (new_floor > g_game.current_floor) {
-            int jumped_floors = new_floor - g_game.current_floor;
-            if (jumped_floors >= 2) {
-                if (g_game.combo_timer > 0) {
-                    g_game.combo_count++;
-                    g_game.combo_floors += jumped_floors;
-                } else {
-                    g_game.combo_count = 1;
-                    g_game.combo_floors = jumped_floors;
-                }
-                g_game.combo_timer = 100; // 100 frames combo timeout
             } else {
-                if (g_game.combo_timer > 0) {
-                    g_game.combo_timer = 1; // combo ends on next single step
+                p->on_edge = 0;
+            }
+            
+            // Combo evaluation (FUN_004034a0 & FUN_004024f0)
+            if (new_floor > g_game.current_floor) {
+                int jumped_floors = new_floor - g_game.current_floor;
+                if (jumped_floors >= 2) {
+                    if (g_game.combo_timer > 0) {
+                        g_game.combo_count++;
+                        g_game.combo_floors += jumped_floors;
+                    } else {
+                        g_game.combo_count = 1;
+                        g_game.combo_floors = jumped_floors;
+                    }
+                    g_game.combo_timer = 100; // 100 frames combo timeout
+                } else {
+                    if (g_game.combo_timer > 0) {
+                        g_game.combo_timer = 1; // single step ends combo
+                    }
+                }
+                g_game.current_floor = new_floor;
+                if (new_floor > g_game.highest_floor) {
+                    g_game.highest_floor = new_floor;
                 }
             }
-            g_game.current_floor = new_floor;
-            if (new_floor > g_game.highest_floor) {
-                g_game.highest_floor = new_floor;
-            }
-        }
-    } else {
-        if (p->state == 0) {
-            // Walked off ledge
-            p->state = 2; // falling
-            p->on_edge = 0;
         }
     }
     
@@ -431,34 +462,33 @@ void update_physics(int input_left, int input_right, int input_jump) {
     }
     
     // 7. Camera follow & clock speed (FUN_004034a0)
-    // If player is above Y=200 in screen coordinates (camera_y > player.y - 200)
     float screen_y = p->y - g_game.camera_y + 240.0f;
     if (screen_y < 160.0f) {
         float diff = 160.0f - screen_y;
-        g_game.camera_y -= diff * 0.2f;
+        g_game.camera_y -= diff * 0.25f;
     }
     
     // Automatic clock scroll
     if (g_game.highest_floor >= 5) {
-        if (g_game.clock_speed < 1.0f) {
-            g_game.clock_speed = 0.5f;
+        if (g_game.clock_speed < 0.6f) {
+            g_game.clock_speed = 0.6f;
         }
         g_game.clock_timer += 1.0f;
         
         // Increase speed at milestones
         if (g_game.clock_timer > 600.0f && g_game.hurry_state == 0) {
             g_game.hurry_state = 1;
-            g_game.clock_speed = 1.0f;
+            g_game.clock_speed = 1.1f;
             trigger_sfx(SFX_HURRYUP);
             trigger_sfx(SFX_RING);
         } else if (g_game.clock_timer > 1200.0f && g_game.hurry_state == 1) {
             g_game.hurry_state = 2;
-            g_game.clock_speed = 1.6f;
+            g_game.clock_speed = 1.7f;
             trigger_sfx(SFX_HURRYUP);
             trigger_sfx(SFX_RING);
         } else if (g_game.clock_timer > 2000.0f && g_game.hurry_state == 2) {
             g_game.hurry_state = 3;
-            g_game.clock_speed = 2.4f;
+            g_game.clock_speed = 2.5f;
             trigger_sfx(SFX_HURRYUP);
             trigger_sfx(SFX_RING);
         }
@@ -479,7 +509,7 @@ void update_physics(int input_left, int input_right, int input_jump) {
     
     // 8. Death / Abyss Check
     float screen_bottom = g_game.camera_y + 240.0f;
-    if (p->y > screen_bottom + 50.0f) {
+    if (p->y > screen_bottom + 40.0f) {
         g_game.game_over = 1;
         g_game.game_over_timer = 0;
         trigger_sfx(SFX_FALLING);
@@ -491,7 +521,7 @@ void update_physics(int input_left, int input_right, int input_jump) {
     p->anim_timer++;
     if (p->state == 0) {
         if (abs_f(p->vx) > 0.3f) {
-            if (p->anim_timer % 6 == 0) {
+            if (p->anim_timer % 5 == 0) {
                 p->anim_frame = (p->anim_frame + 1) % 4;
             }
         } else {

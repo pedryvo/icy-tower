@@ -18,10 +18,24 @@ export class InputManager {
   private touchStartX = 0;
   private touchStartY = 0;
   private touchStartTime = 0;
+  private onInteractCallback: (() => void) | null = null;
 
-  constructor() {
+  constructor(onInteract?: () => void) {
+    if (onInteract) {
+      this.onInteractCallback = onInteract;
+    }
     this.bindKeyboard();
     this.bindTouchControls();
+  }
+
+  setOnInteract(cb: () => void): void {
+    this.onInteractCallback = cb;
+  }
+
+  private notifyInteract(): void {
+    if (this.onInteractCallback) {
+      this.onInteractCallback();
+    }
   }
 
   get input(): InputState {
@@ -43,6 +57,8 @@ export class InputManager {
 
   private bindKeyboard(): void {
     window.addEventListener('keydown', (e) => {
+      this.notifyInteract();
+
       if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(e.code)) {
         e.preventDefault();
       }
@@ -79,7 +95,6 @@ export class InputManager {
   }
 
   private bindTouchControls(): void {
-    // Setup on-screen buttons
     const btnLeft = document.getElementById('btn-left');
     const btnRight = document.getElementById('btn-right');
     const btnJump = document.getElementById('btn-jump');
@@ -88,13 +103,12 @@ export class InputManager {
       if (!elem) return;
       const start = (e: Event) => {
         e.preventDefault();
-        e.stopPropagation();
+        this.notifyInteract();
         this.triggerHaptic(20);
         onPress();
       };
       const end = (e: Event) => {
         e.preventDefault();
-        e.stopPropagation();
         onRelease();
       };
       elem.addEventListener('touchstart', start, { passive: false });
@@ -118,6 +132,7 @@ export class InputManager {
 
     // Global touch/swipe gestures on screen
     window.addEventListener('touchstart', (e) => {
+      this.notifyInteract();
       if (e.touches.length > 0) {
         this.touchStartX = e.touches[0].clientX;
         this.touchStartY = e.touches[0].clientY;
@@ -126,6 +141,7 @@ export class InputManager {
     }, { passive: true });
 
     window.addEventListener('touchend', (e) => {
+      this.notifyInteract();
       if (e.changedTouches.length > 0) {
         const dx = e.changedTouches[0].clientX - this.touchStartX;
         const dy = e.changedTouches[0].clientY - this.touchStartY;

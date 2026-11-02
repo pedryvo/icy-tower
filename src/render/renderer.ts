@@ -106,9 +106,69 @@ export class Renderer {
     }
   }
 
-  render(wasm: WasmPhysicsExports, gameState: 'title' | 'playing' | 'paused' | 'gameover', t: TranslationStrings): void {
+  private drawRoundedBadge(
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    radius: number,
+    bgColorTop: string,
+    bgColorBottom: string,
+    borderColor: string,
+    shadowColor: string
+  ): void {
     const ctx = this.ctx;
-    const dpr = window.devicePixelRatio || 1;
+    ctx.save();
+    
+    // Drop shadow
+    ctx.shadowColor = shadowColor;
+    ctx.shadowBlur = 8;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 2;
+
+    // Draw background
+    ctx.beginPath();
+    if (typeof ctx.roundRect === 'function') {
+      ctx.roundRect(x, y, w, h, radius);
+    } else {
+      ctx.rect(x, y, w, h);
+    }
+
+    const grad = ctx.createLinearGradient(x, y, x, y + h);
+    grad.addColorStop(0, bgColorTop);
+    grad.addColorStop(1, bgColorBottom);
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Border
+    ctx.shadowBlur = 4;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = borderColor;
+    ctx.stroke();
+
+    // Inner highlight reflection line
+    ctx.beginPath();
+    if (typeof ctx.roundRect === 'function') {
+      ctx.roundRect(x + 2, y + 2, w - 4, Math.floor(h * 0.4), [radius - 2, radius - 2, 0, 0]);
+    } else {
+      ctx.rect(x + 2, y + 2, w - 4, Math.floor(h * 0.4));
+    }
+    const highlightGrad = ctx.createLinearGradient(x, y + 2, x, y + Math.floor(h * 0.4));
+    highlightGrad.addColorStop(0, 'rgba(255, 255, 255, 0.22)');
+    highlightGrad.addColorStop(1, 'rgba(255, 255, 255, 0.02)');
+    ctx.fillStyle = highlightGrad;
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  render(
+    wasm: WasmPhysicsExports,
+    gameState: 'title' | 'playing' | 'paused' | 'gameover',
+    t: TranslationStrings,
+    highScore = 0
+  ): void {
+    const ctx = this.ctx;
     const fullW = this.canvas.width;
     const fullH = this.canvas.height;
 
@@ -149,48 +209,43 @@ export class Renderer {
     // Tower walls (Left wall at 0..85, Right wall at 555..640)
     if (sideblock) {
       const wallH = sideblock.height;
-      const scrollY = ((-cameraY * this.scale) % wallH);
+      const scrollY = ((-cameraY * this.scale) % (wallH * this.scale)) / this.scale;
       
-      // Draw left wall
+      // Left Wall
       for (let y = -wallH + scrollY; y < this.GAME_HEIGHT + wallH; y += wallH) {
-        ctx.drawImage(sideblock, -sideblock.width + 85, y);
+        ctx.drawImage(sideblock, 0, y);
       }
-      // Draw right wall (flipped)
+
+      // Right Wall (flipped horizontally)
+      ctx.save();
+      ctx.translate(this.GAME_WIDTH, 0);
+      ctx.scale(-1, 1);
       for (let y = -wallH + scrollY; y < this.GAME_HEIGHT + wallH; y += wallH) {
-        ctx.save();
-        ctx.translate(555, y);
-        ctx.scale(-1, 1);
-        ctx.drawImage(sideblock, -sideblock.width, 0);
-        ctx.restore();
+        ctx.drawImage(sideblock, 0, y);
       }
+      ctx.restore();
     }
 
     // 3. Render Platforms
     const platCount = wasm.get_platform_count();
     for (let i = 0; i < platCount; i++) {
       if (!wasm.get_platform_active(i)) continue;
-      
-      const floorNum = wasm.get_platform_floor(i);
+
       const platY = wasm.get_platform_y(i);
+      const screenY = Math.round(platY - cameraY + 240);
+      if (screenY < -40 || screenY > this.GAME_HEIGHT + 40) continue;
+
       const startTile = wasm.get_platform_start(i);
       const endTile = wasm.get_platform_end(i);
-      const type = wasm.get_platform_type(i); // 0: ice, 1: wood, 2: cloud, 3: bone
-      
-      // Screen Y coordinate
-      const screenY = platY - cameraY + 240;
-      if (screenY < -50 || screenY > this.GAME_HEIGHT + 50) continue;
+      const floorType = wasm.get_platform_type(i);
+      const floorNum = wasm.get_platform_floor(i);
 
-      // Select tile names based on theme
-      let leftName = 'floor01';
-      let midName = 'floor02';
-      let rightName = 'floor03';
-      if (type === 1) {
-        leftName = 'floor04'; midName = 'floor05'; rightName = 'floor06';
-      } else if (type === 2) {
-        leftName = 'floor07'; midName = 'floor08'; rightName = 'floor09';
-      } else if (type === 3) {
-        leftName = 'floor10'; midName = 'floor11'; rightName = 'floor12';
-      }
+      // Floor texture indexing: 1..12
+      const texIndex = ((floorType - 1) % 12) + 1;
+      const pad = texIndex < 10 ? `0${texIndex}` : `${texIndex}`;
+      const leftName = `floor${pad}`;
+      const midName = `floor${pad}`;
+      const rightName = `floor${pad}`;
 
       const imgLeft = this.images.get(leftName);
       const imgMid = this.images.get(midName);
@@ -214,20 +269,20 @@ export class Renderer {
         ctx.drawImage(imgRight, endX - 16, screenY);
       }
 
-      // Draw floor milestone marker on special floors (50, 100, 150...)
-      if (floorNum > 0 && floorNum % 50 === 0) {
-        const signImg = this.images.get('sign01');
-        const midX = (startX + endX) / 2;
+      // Draw milestone floor sign marker on every 10th floor (10, 20, 30...)
+      if (floorNum > 0 && floorNum % 10 === 0) {
+        const signImg = this.images.get(floorNum % 50 === 0 ? 'sign04' : 'sign01');
+        const midX = Math.round((startX + endX) / 2);
         if (signImg) {
           ctx.drawImage(signImg, midX - signImg.width / 2, screenY - signImg.height - 2);
         }
         ctx.save();
-        ctx.font = 'bold 16px monospace';
-        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 15px "Courier New", monospace';
+        ctx.fillStyle = floorNum % 50 === 0 ? '#ffea00' : '#ffffff';
         ctx.shadowColor = '#000000';
-        ctx.shadowBlur = 4;
+        ctx.shadowBlur = 5;
         ctx.textAlign = 'center';
-        ctx.fillText(`${floorNum}`, midX, screenY + 20);
+        ctx.fillText(`${floorNum}`, midX, screenY - 8);
         ctx.restore();
       }
     }
@@ -258,25 +313,38 @@ export class Renderer {
       }
     } else if (state === 1) { // jumping
       if (vy < -16) {
-        heroSpriteName = 'hero008'; // super high jump stretch
-      } else {
+        heroSpriteName = 'hero007'; // super jump launch
+      } else if (vy < -8) {
         heroSpriteName = 'hero006';
+      } else {
+        heroSpriteName = 'hero005';
       }
-    } else { // falling
-      heroSpriteName = 'hero010';
+    } else if (state === 2) { // falling
+      if (vy > 6) {
+        heroSpriteName = 'hero009'; // fast plummet
+      } else {
+        heroSpriteName = 'hero008';
+      }
+    }
+
+    // Wall bounce / spin flip
+    if (spin !== 0) {
+      const spinFrames = ['hero010', 'hero011', 'hero000'];
+      heroSpriteName = spinFrames[animFrame % 3];
     }
 
     const heroImg = this.images.get(heroSpriteName) || this.images.get('hero000');
     if (heroImg) {
-      const pScreenX = px;
-      const pScreenY = py - cameraY + 240;
+      const pScreenX = Math.round(px);
+      const pScreenY = Math.round(py - cameraY + 240);
 
       ctx.save();
       ctx.translate(pScreenX, pScreenY);
 
-      // Spin rotation if in flip spin
+      // Spin rotation if in spin mode
       if (spin !== 0) {
-        ctx.rotate(spin);
+        const spinAngle = (animFrame * 0.45 * spin);
+        ctx.rotate(spinAngle);
       }
 
       // Horizontal flip if facing left
@@ -299,10 +367,10 @@ export class Renderer {
 
       const starImg = this.images.get(`star0${p.spriteIndex}`);
       if (starImg) {
-        const pScreenY = p.y - cameraY + 240;
+        const pScreenY = Math.round(p.y - cameraY + 240);
         ctx.save();
         ctx.globalAlpha = Math.max(0, 1 - p.life / p.maxLife);
-        ctx.drawImage(starImg, p.x - starImg.width / 2, pScreenY - starImg.height / 2);
+        ctx.drawImage(starImg, Math.round(p.x - starImg.width / 2), Math.round(pScreenY - starImg.height / 2));
         ctx.restore();
       }
 
@@ -357,7 +425,6 @@ export class Renderer {
       const clockTimer = wasm.get_clock_timer();
       const angle = (clockTimer * 0.04) % (Math.PI * 2);
       ctx.save();
-      // Pivot center of clock
       ctx.translate(clockX + clockImg.width / 2, clockY + clockImg.height / 2);
       ctx.rotate(angle);
       ctx.drawImage(clockHand, -clockHand.width / 2, -clockHand.height + 6);
@@ -371,7 +438,6 @@ export class Renderer {
       const bannerImg = this.images.get(`reware00${bannerType}`);
       if (bannerImg) {
         ctx.save();
-        // Pop-in scale bounce
         const scaleFactor = bannerTimer > 70 ? 1 + (bannerTimer - 70) * 0.03 : 1;
         const bannerW = bannerImg.width * scaleFactor;
         const bannerH = bannerImg.height * scaleFactor;
@@ -385,23 +451,85 @@ export class Renderer {
       }
     }
 
-    // 9. Retro HUD (Score & Highest Floor)
+    // 9. REFINED RETRO ARCADE HUD (Andar / Pontos / Recorde)
     const currentFloor = wasm.get_current_floor();
     const score = wasm.get_score();
 
+    // Floor Badge (ANDAR / FLOOR)
+    this.drawRoundedBadge(
+      112, 12, 138, 56, 8,
+      'rgba(24, 20, 8, 0.90)', 'rgba(12, 10, 4, 0.95)',
+      '#f5b800', 'rgba(245, 184, 0, 0.45)'
+    );
+
     ctx.save();
-    ctx.font = 'bold 20px monospace';
-    ctx.fillStyle = '#ffffff';
+    // Label
+    ctx.font = '900 11px sans-serif';
+    ctx.fillStyle = '#ffcf33';
     ctx.shadowColor = '#000000';
-    ctx.shadowBlur = 4;
-    ctx.fillText(`${t.floor}: ${currentFloor}`, 110, 36);
-    ctx.fillText(`${t.score}: ${score}`, 110, 62);
+    ctx.shadowBlur = 3;
+    ctx.textAlign = 'center';
+    ctx.fillText(`▲ ${t.floor.toUpperCase()}`, 112 + 138 / 2, 28);
+
+    // Number
+    ctx.font = '900 24px "Courier New", monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.shadowColor = '#e69500';
+    ctx.shadowBlur = 6;
+    ctx.fillText(`${currentFloor}`, 112 + 138 / 2, 55);
+    ctx.restore();
+
+    // Score Badge (PONTOS / SCORE)
+    this.drawRoundedBadge(
+      260, 12, 155, 56, 8,
+      'rgba(6, 22, 28, 0.90)', 'rgba(3, 12, 16, 0.95)',
+      '#00d4e6', 'rgba(0, 212, 230, 0.45)'
+    );
+
+    ctx.save();
+    // Label
+    ctx.font = '900 11px sans-serif';
+    ctx.fillStyle = '#00e5ff';
+    ctx.shadowColor = '#000000';
+    ctx.shadowBlur = 3;
+    ctx.textAlign = 'center';
+    ctx.fillText(`★ ${t.score.toUpperCase()}`, 260 + 155 / 2, 28);
+
+    // Number
+    ctx.font = '900 22px "Courier New", monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.shadowColor = '#008cb3';
+    ctx.shadowBlur = 6;
+    ctx.fillText(`${score.toLocaleString()}`, 260 + 155 / 2, 55);
+    ctx.restore();
+
+    // Best Record Badge (RECORDE / BEST)
+    this.drawRoundedBadge(
+      425, 12, 125, 56, 8,
+      'rgba(26, 12, 26, 0.90)', 'rgba(14, 6, 14, 0.95)',
+      '#e056b3', 'rgba(224, 86, 179, 0.45)'
+    );
+
+    ctx.save();
+    // Label
+    ctx.font = '900 11px sans-serif';
+    ctx.fillStyle = '#ff78c8';
+    ctx.shadowColor = '#000000';
+    ctx.shadowBlur = 3;
+    ctx.textAlign = 'center';
+    ctx.fillText(`👑 ${t.best.toUpperCase()}`, 425 + 125 / 2, 28);
+
+    // Number
+    ctx.font = '900 19px "Courier New", monospace';
+    ctx.fillStyle = '#ffe8f5';
+    ctx.shadowColor = '#aa2277';
+    ctx.shadowBlur = 6;
+    ctx.fillText(`${Math.max(highScore, score).toLocaleString()}`, 425 + 125 / 2, 54);
     ctx.restore();
 
     // 10. Title Screen Overlay
     if (gameState === 'title') {
       const titleImg = this.images.get('title');
-      const titleBg = this.images.get('title_bg');
 
       ctx.save();
       ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
@@ -411,7 +539,20 @@ export class Renderer {
         ctx.drawImage(titleImg, (this.GAME_WIDTH - titleImg.width) / 2, 60);
       }
 
-      ctx.font = 'bold 24px monospace';
+      // Best Score Banner on Title
+      if (highScore > 0) {
+        this.drawRoundedBadge(
+          (this.GAME_WIDTH - 240) / 2, 280, 240, 44, 8,
+          'rgba(26, 12, 26, 0.92)', 'rgba(14, 6, 14, 0.95)',
+          '#e056b3', 'rgba(224, 86, 179, 0.5)'
+        );
+        ctx.font = 'bold 16px "Courier New", monospace';
+        ctx.fillStyle = '#ffd6f0';
+        ctx.textAlign = 'center';
+        ctx.fillText(`👑 ${t.best.toUpperCase()}: ${highScore.toLocaleString()}`, this.GAME_WIDTH / 2, 308);
+      }
+
+      ctx.font = 'bold 22px "Courier New", monospace';
       ctx.fillStyle = '#ffe040';
       ctx.shadowColor = '#d94000';
       ctx.shadowBlur = 8;
@@ -419,10 +560,10 @@ export class Renderer {
       
       const blink = Math.floor(Date.now() / 400) % 2 === 0;
       if (blink) {
-        ctx.fillText(t.pressKeyToStart, this.GAME_WIDTH / 2, 380);
+        ctx.fillText(t.pressKeyToStart, this.GAME_WIDTH / 2, 370);
       }
 
-      ctx.font = '14px monospace';
+      ctx.font = '13px monospace';
       ctx.fillStyle = '#a0d0ff';
       ctx.shadowBlur = 2;
       ctx.fillText(t.mobileControlsPrompt, this.GAME_WIDTH / 2, 420);
@@ -433,31 +574,55 @@ export class Renderer {
     if (gameState === 'gameover' || isGameOver) {
       const gameOverImg = this.images.get('gameover');
       ctx.save();
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
       ctx.fillRect(0, 0, this.GAME_WIDTH, this.GAME_HEIGHT);
 
       if (gameOverImg) {
-        ctx.drawImage(gameOverImg, (this.GAME_WIDTH - gameOverImg.width) / 2, 100);
+        ctx.drawImage(gameOverImg, (this.GAME_WIDTH - gameOverImg.width) / 2, 70);
       }
 
-      ctx.font = 'bold 26px monospace';
-      ctx.fillStyle = '#ffffff';
-      ctx.shadowColor = '#000000';
-      ctx.shadowBlur = 6;
-      ctx.textAlign = 'center';
-      ctx.fillText(`${t.floor}: ${currentFloor}`, this.GAME_WIDTH / 2, 270);
-      ctx.fillText(`${t.score}: ${score}`, this.GAME_WIDTH / 2, 310);
+      // Summary Card
+      const cardW = 320;
+      const cardH = 140;
+      const cardX = (this.GAME_WIDTH - cardW) / 2;
+      const cardY = 200;
+      this.drawRoundedBadge(
+        cardX, cardY, cardW, cardH, 12,
+        'rgba(16, 18, 32, 0.95)', 'rgba(8, 9, 18, 0.98)',
+        '#ffe040', 'rgba(255, 224, 64, 0.4)'
+      );
 
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 20px "Courier New", monospace';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(`${t.floor}: ${currentFloor}`, this.GAME_WIDTH / 2, cardY + 45);
+      ctx.fillText(`${t.score}: ${score.toLocaleString()}`, this.GAME_WIDTH / 2, cardY + 80);
+
+      if (score >= highScore && score > 0) {
+        ctx.font = 'bold 15px "Courier New", monospace';
+        ctx.fillStyle = '#ff78c8';
+        ctx.fillText(`🎉 NEW RECORD / NOVO RECORDE! 🎉`, this.GAME_WIDTH / 2, cardY + 115);
+      } else {
+        ctx.font = '14px "Courier New", monospace';
+        ctx.fillStyle = '#a0c0e0';
+        ctx.fillText(`${t.best}: ${highScore.toLocaleString()}`, this.GAME_WIDTH / 2, cardY + 115);
+      }
+
+      ctx.font = 'bold 22px "Courier New", monospace';
       ctx.fillStyle = '#ffe040';
       ctx.shadowColor = '#ff4000';
-      ctx.fillText(t.restart, this.GAME_WIDTH / 2, 380);
+      ctx.shadowBlur = 8;
+      const blink = Math.floor(Date.now() / 350) % 2 === 0;
+      if (blink) {
+        ctx.fillText(t.restart, this.GAME_WIDTH / 2, 385);
+      }
       ctx.restore();
     }
 
     // 12. Paused Overlay
     if (gameState === 'paused') {
       ctx.save();
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
       ctx.fillRect(0, 0, this.GAME_WIDTH, this.GAME_HEIGHT);
 
       ctx.font = 'bold 36px monospace';

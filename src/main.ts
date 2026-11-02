@@ -10,19 +10,37 @@ class GameApp {
   private wasm: WasmPhysics = new WasmPhysics();
   private sound: SoundManager = new SoundManager();
   private renderer: Renderer;
-  private input: InputManager = new InputManager();
+  private input: InputManager;
   
   private state: 'title' | 'playing' | 'paused' | 'gameover' = 'title';
   private currentLang: Language = getSystemLanguage();
   private lastTime: number = 0;
   private physicsAccumulator: number = 0;
   private readonly FIXED_STEP: number = 1000 / 60; // 60 Hz physics
+  private highScore: number = 0;
 
   constructor() {
     const canvas = document.getElementById('game-canvas') as HTMLCanvasElement;
     if (!canvas) throw new Error('Game canvas element not found');
     this.canvas = canvas;
     this.renderer = new Renderer(canvas);
+
+    // Load persistent high score
+    const saved = localStorage.getItem('icytower_highscore');
+    if (saved) {
+      const parsed = parseInt(saved, 10);
+      if (!isNaN(parsed)) {
+        this.highScore = parsed;
+      }
+    }
+
+    // Connect input manager with sound unlocking
+    this.input = new InputManager(() => {
+      this.sound.unlock();
+      if (this.state === 'title') {
+        this.sound.playMusic('bg_menu', true);
+      }
+    });
   }
 
   async start(): Promise<void> {
@@ -42,17 +60,16 @@ class GameApp {
       this.renderer.resize();
     });
 
-    // 5. Attach audio unlock to any click or touch
-    const unlockAudio = () => {
+    // 5. Attach audio unlock to any interaction event
+    const unlockAndPlayTitle = () => {
       this.sound.unlock();
       if (this.state === 'title') {
         this.sound.playMusic('bg_menu', true);
       }
-      window.removeEventListener('pointerdown', unlockAudio);
-      window.removeEventListener('keydown', unlockAudio);
     };
-    window.addEventListener('pointerdown', unlockAudio);
-    window.addEventListener('keydown', unlockAudio);
+    ['pointerdown', 'touchstart', 'mousedown', 'keydown', 'click'].forEach((evt) => {
+      window.addEventListener(evt, unlockAndPlayTitle, { passive: true });
+    });
 
     // 6. Setup UI Button Handlers
     this.setupUI();
@@ -170,6 +187,13 @@ class GameApp {
           const events = wasm.get_sound_events();
           this.processSoundEvents(events);
 
+          // Update and persist high score
+          const curScore = wasm.get_score();
+          if (curScore > this.highScore) {
+            this.highScore = curScore;
+            localStorage.setItem('icytower_highscore', `${this.highScore}`);
+          }
+
           if (wasm.get_game_over()) {
             this.state = 'gameover';
             this.sound.stopMusic();
@@ -194,9 +218,9 @@ class GameApp {
       }
     }
 
-    // Render current frame
+    // Render current frame with high score
     const t = getTranslations(this.currentLang);
-    this.renderer.render(wasm, this.state, t);
+    this.renderer.render(wasm, this.state, t, this.highScore);
 
     requestAnimationFrame((t) => this.gameLoop(t));
   }
