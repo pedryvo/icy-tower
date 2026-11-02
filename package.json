@@ -1,0 +1,16 @@
+{
+  "name": "icy-tower",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reverse engineering and modern web port (WASM + HTML5 Canvas + TypeScript) of Icy Tower 1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "vite": "^5.4.1"
+  }
+}
