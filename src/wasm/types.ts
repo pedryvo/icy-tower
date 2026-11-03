@@ -11,6 +11,7 @@ export interface WasmPhysicsExports {
   get_player_spin(): number;
   get_player_on_edge(): number;
   get_player_anim_frame(): number;
+  get_player_anim_timer(): number;
   get_camera_y(): number;
   get_clock_timer(): number;
   get_highest_floor(): number;

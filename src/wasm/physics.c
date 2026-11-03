@@ -156,16 +156,17 @@ static void generate_platforms_ahead(void) {
         p->type = theme;
         
         if (floor_num == 0 || (floor_num % 50 == 0)) {
-            // Full width floor (floor 0 and every 50 floors)
-            p->tile_start = 5;
-            p->tile_end = 35;
+            // Full width floor (floor 0 and every 50 floors, extends behind side walls)
+            p->tile_start = 0;
+            p->tile_end = 40;
         } else {
             // Formula from FUN_00404ff0:
-            int max_len = 16 - min_f(floor_num / 50, 10);
+            // Inner playfield between walls (x=75..565) spans tiles 5..34
+            int max_len = 15 - (int)min_f((float)(floor_num / 50), 9.0f);
             if (max_len < 6) max_len = 6;
-            int length = (rand_next() % max_len) + 6;
-            if (length > 25) length = 25;
-            int max_start = 34 - length;
+            int length = (rand_next() % max_len) + 5;
+            if (length > 24) length = 24;
+            int max_start = 35 - length;
             if (max_start < 6) max_start = 6;
             int start = (rand_next() % (max_start - 5)) + 5;
             
@@ -181,11 +182,11 @@ static int find_landing_platform(float px, float py, float prev_py) {
         Platform* p = &g_game.platforms[i];
         if (!p->active) continue;
         
-        float plat_left = p->tile_start * TILE_SIZE;
-        float plat_right = p->tile_end * TILE_SIZE;
+        float plat_left = p->tile_start * TILE_SIZE - 4.0f;
+        float plat_right = (p->tile_end + 1) * TILE_SIZE + 4.0f;
         
-        // Foot horizontal contact: foot spans [px - 11, px + 11]
-        if ((px + 11.0f >= plat_left) && (px - 11.0f <= plat_right)) {
+        // Foot horizontal contact: foot spans [px - 10, px + 10]
+        if ((px + 10.0f >= plat_left) && (px - 10.0f <= plat_right)) {
             // Foot was above or at platform on previous frame, and is at or slightly below platform now
             if (prev_py <= p->y + 2.0f && py >= p->y - 4.0f && py <= p->y + 16.0f) {
                 return i;
@@ -347,16 +348,16 @@ void update_physics(int input_left, int input_right, int input_jump) {
         int still_supported = 0;
         if (plat_idx >= 0 && plat_idx < MAX_PLATFORMS && g_game.platforms[plat_idx].active) {
             Platform* cur_p = &g_game.platforms[plat_idx];
-            float plat_left = cur_p->tile_start * TILE_SIZE;
-            float plat_right = cur_p->tile_end * TILE_SIZE;
+            float plat_left = cur_p->tile_start * TILE_SIZE - 4.0f;
+            float plat_right = (cur_p->tile_end + 1) * TILE_SIZE + 4.0f;
             
-            if ((p->x + 11.0f >= plat_left) && (p->x - 11.0f <= plat_right)) {
+            if ((p->x + 10.0f >= plat_left) && (p->x - 10.0f <= plat_right)) {
                 still_supported = 1;
                 p->y = cur_p->y; // Lock solidly to platform height
                 p->vy = 0.0f;
                 
-                // Edge wobble check
-                if (abs_f(p->x - plat_left) < 14.0f || abs_f(p->x - plat_right) < 14.0f) {
+                // Edge wobble check (skip on full-width floors)
+                if (cur_p->tile_start > 0 && (abs_f(p->x - plat_left) < 12.0f || abs_f(p->x - plat_right) < 12.0f)) {
                     if (!p->on_edge) {
                         p->on_edge = 1;
                         trigger_sfx(SFX_EDGE);
@@ -389,9 +390,9 @@ void update_physics(int input_left, int input_right, int input_jump) {
             int new_floor = landed->floor_num;
             
             // Edge wobble check
-            float plat_left = landed->tile_start * TILE_SIZE;
-            float plat_right = landed->tile_end * TILE_SIZE;
-            if (abs_f(p->x - plat_left) < 14.0f || abs_f(p->x - plat_right) < 14.0f) {
+            float plat_left = landed->tile_start * TILE_SIZE - 4.0f;
+            float plat_right = (landed->tile_end + 1) * TILE_SIZE + 4.0f;
+            if (landed->tile_start > 0 && (abs_f(p->x - plat_left) < 12.0f || abs_f(p->x - plat_right) < 12.0f)) {
                 p->on_edge = 1;
                 trigger_sfx(SFX_EDGE);
             } else {
@@ -557,6 +558,9 @@ int get_player_on_edge(void) { return g_game.player.on_edge; }
 
 __attribute__((export_name("get_player_anim_frame")))
 int get_player_anim_frame(void) { return g_game.player.anim_frame; }
+
+__attribute__((export_name("get_player_anim_timer")))
+int get_player_anim_timer(void) { return g_game.player.anim_timer; }
 
 __attribute__((export_name("get_camera_y")))
 float get_camera_y(void) { return g_game.camera_y; }

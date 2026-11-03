@@ -1,11 +1,12 @@
 import type { WasmPhysicsExports } from './types';
+import hashedWasmUrl from './icytower_physics.wasm?url';
 
 export class WasmPhysics {
   private instance: WasmPhysicsExports | null = null;
 
-  async init(wasmUrl = '/icytower_physics.wasm'): Promise<void> {
+  async init(wasmUrl = hashedWasmUrl): Promise<void> {
     try {
-      const response = await fetch(wasmUrl);
+      const response = await fetch(wasmUrl, { cache: 'no-store' });
       const buffer = await response.arrayBuffer();
       const { instance } = await WebAssembly.instantiate(buffer, {
         env: {}

@@ -16,6 +16,7 @@ export class Renderer {
   private ctx: CanvasRenderingContext2D;
   private images: Map<string, HTMLImageElement> = new Map();
   private particles: Particle[] = [];
+  private cylindricalBg: HTMLCanvasElement | null = null;
   
   // Logical game resolution
   readonly GAME_WIDTH = 640;
@@ -64,6 +65,56 @@ export class Renderer {
     });
 
     await Promise.all(promises);
+    this.buildCylindricalBackground();
+  }
+
+  /**
+   * Reconstructs the exact 640x64 3D cylindrical brick tower texture
+   * from FUN_00401db0 in icytower.exe:
+   * - Staggered brick courses (row 0 offset by 32px, row 1 offset by 0px)
+   * - Bricks foreshorten horizontally as they wrap toward the walls: w = 64 - (offset >> 2)
+   * - Cylindrical shading gradient darkens toward the left (x=75) and right (x=565) walls
+   */
+  private buildCylindricalBackground(): void {
+    const bgtile = this.images.get('bgtile');
+    if (!bgtile) return;
+
+    const offscreen = document.createElement('canvas');
+    offscreen.width = 640;
+    offscreen.height = 64;
+    const octx = offscreen.getContext('2d');
+    if (!octx) return;
+    octx.imageSmoothingEnabled = false;
+
+    for (let row = 0; row < 2; row++) {
+      const y = row * 32;
+      let offset = row === 0 ? 32 : 0;
+
+      // Center brick on row 0 (spans 288..352)
+      if (row === 0) {
+        octx.drawImage(bgtile, 0, 0, 64, 32, 320 - 32, y, 64, 32);
+      }
+
+      while (offset < 320) {
+        const w = Math.max(8, 64 - (offset >> 2));
+        // Right side of tower cylinder
+        octx.drawImage(bgtile, 0, 0, 64, 32, 320 + offset, y, w, 32);
+        // Left side of tower cylinder
+        octx.drawImage(bgtile, 0, 0, 64, 32, 320 - offset - w, y, w, 32);
+        offset += w;
+      }
+    }
+
+    // Apply cylindrical 3D shadow ramp across x = 0..640 (matching FUN_00401db0 palette ramp)
+    for (let x = 0; x < 640; x++) {
+      const dist = Math.abs(x - 320) / 255; // 0 at center, ~1.0 at walls (x=65..575)
+      const curve = Math.min(1, dist * dist * 0.85 + dist * 0.15);
+      const alpha = 0.08 + curve * 0.76;
+      octx.fillStyle = `rgba(4, 6, 18, ${alpha.toFixed(3)})`;
+      octx.fillRect(x, 0, 1, 64);
+    }
+
+    this.cylindricalBg = offscreen;
   }
 
   getImage(name: string): HTMLImageElement | undefined {
@@ -179,118 +230,136 @@ export class Renderer {
     const bgtile = this.images.get('bgtile');
     const sideblock = this.images.get('sideblock');
 
-    // 1. Fill entire background with scrolling tower stone tiles
-    const cameraY = wasm.get_camera_y();
+    // Single integer camera Y per frame to prevent any sub-pixel jitter between platforms and player
+    const camY = Math.round(wasm.get_camera_y());
+
+    // 1. Fill outer widescreen backdrop with darkened staggered tower bricks
     if (bgtile) {
-      const bgW = bgtile.width * this.scale;
-      const bgH = bgtile.height * this.scale;
-      const scrollY = ((-cameraY * 0.5 * this.scale) % bgH);
+      const bgW = Math.max(1, Math.round(bgtile.width * this.scale));
+      const bgH = Math.max(1, Math.round(bgtile.height * this.scale));
+      const rawScroll = Math.round(-camY * 0.5 * this.scale) % (bgH * 2);
+      const scrollY = rawScroll > 0 ? rawScroll - bgH * 2 : rawScroll;
 
       ctx.save();
-      for (let y = -bgH + scrollY; y < fullH + bgH; y += bgH) {
-        for (let x = 0; x < fullW; x += bgW) {
-          ctx.drawImage(bgtile, x, y, bgW + 1, bgH + 1);
+      let rowIdx = 0;
+      for (let y = scrollY; y < fullH + bgH; y += bgH) {
+        const stagger = (rowIdx & 1) ? Math.round(bgW / 2) : 0;
+        for (let x = -stagger; x < fullW + bgW; x += bgW) {
+          ctx.drawImage(bgtile, x, y, bgW, bgH);
         }
+        rowIdx++;
       }
-      // Add subtle dark gradient overlay for depth
-      const grad = ctx.createLinearGradient(0, 0, 0, fullH);
-      grad.addColorStop(0, 'rgba(0, 5, 20, 0.45)');
-      grad.addColorStop(1, 'rgba(0, 0, 10, 0.7)');
-      ctx.fillStyle = grad;
+      ctx.fillStyle = 'rgba(4, 6, 16, 0.72)';
       ctx.fillRect(0, 0, fullW, fullH);
       ctx.restore();
     }
 
-    // 2. Setup game view transformation
+    // 2. Setup 640x480 logical game view transformation
     ctx.save();
     ctx.translate(this.offsetX, this.offsetY);
     ctx.scale(this.scale, this.scale);
 
-    // Tower walls (Left wall at 0..85, Right wall at 555..640)
-    if (sideblock) {
-      const wallH = sideblock.height;
-      const scrollY = ((-cameraY * this.scale) % (wallH * this.scale)) / this.scale;
-      
-      // Left Wall
-      for (let y = -wallH + scrollY; y < this.GAME_HEIGHT + wallH; y += wallH) {
-        ctx.drawImage(sideblock, 0, y);
-      }
+    // Clip to logical 640x480 playfield so side walls (-57..75 and 565..697) have clean outer edges
+    ctx.beginPath();
+    ctx.rect(0, 0, this.GAME_WIDTH, this.GAME_HEIGHT);
+    ctx.clip();
 
-      // Right Wall (flipped horizontally)
-      ctx.save();
-      ctx.translate(this.GAME_WIDTH, 0);
-      ctx.scale(-1, 1);
-      for (let y = -wallH + scrollY; y < this.GAME_HEIGHT + wallH; y += wallH) {
-        ctx.drawImage(sideblock, 0, y);
+    // 2a. Render authentic 3D cylindrical brick background (FUN_00401db0)
+    if (this.cylindricalBg) {
+      const cylH = 64;
+      const bgScroll = (((-Math.floor(camY * 0.5)) % cylH) + cylH) % cylH - cylH;
+      for (let y = bgScroll; y < this.GAME_HEIGHT + cylH; y += cylH) {
+        ctx.drawImage(this.cylindricalBg, 0, y);
       }
-      ctx.restore();
     }
 
-    // 3. Render Platforms
+    // 3. Render Platforms (FUN_00402780: 3-part cap/middle/cap system)
     const platCount = wasm.get_platform_count();
     for (let i = 0; i < platCount; i++) {
       if (!wasm.get_platform_active(i)) continue;
 
       const platY = wasm.get_platform_y(i);
-      const screenY = Math.round(platY - cameraY + 240);
-      if (screenY < -40 || screenY > this.GAME_HEIGHT + 40) continue;
+      const screenY = Math.round(platY) - camY + 240;
+      if (screenY < -50 || screenY > this.GAME_HEIGHT + 50) continue;
 
       const startTile = wasm.get_platform_start(i);
       const endTile = wasm.get_platform_end(i);
       const floorType = wasm.get_platform_type(i);
       const floorNum = wasm.get_platform_floor(i);
 
-      // Floor texture indexing: 1..12 (floorType is 0-indexed: 0..11)
-      const texIndex = (Math.abs(floorType) % 12) + 1;
-      const pad = texIndex < 10 ? `0${texIndex}` : `${texIndex}`;
-      const defaultFloor = this.images.get('floor01');
-      const imgLeft = this.images.get(`floor${pad}`) || defaultFloor;
-      const imgMid = this.images.get(`floor${pad}`) || defaultFloor;
-      const imgRight = this.images.get(`floor${pad}`) || defaultFloor;
+      // 4 themes (0..3), each theme has 3 sprites: Left Cap, Middle Tile, Right Cap
+      const theme = Math.abs(floorType) % 4;
+      const leftIdx = theme * 3 + 1;
+      const midIdx = theme * 3 + 2;
+      const rightIdx = theme * 3 + 3;
+      const pad = (n: number) => (n < 10 ? `0${n}` : `${n}`);
 
-      const startX = startTile * 16;
-      const endX = endTile * 16;
+      const imgLeft = this.images.get(`floor${pad(leftIdx)}`) || this.images.get('floor01');
+      const imgMid = this.images.get(`floor${pad(midIdx)}`) || this.images.get('floor02');
+      const imgRight = this.images.get(`floor${pad(rightIdx)}`) || this.images.get('floor03');
 
-      // Left cap
+      const drawY = screenY - 6;
+
+      // Left cap (21px wide, starts at startTile * 16 - 5 and ends at (startTile + 1) * 16)
       if (imgLeft) {
-        ctx.drawImage(imgLeft, startX - (imgLeft.width - 16), screenY);
+        ctx.drawImage(imgLeft, startTile * 16 - 5, drawY);
       }
-      // Middle repeat tiles
+
+      // Middle tiles (16px wide, from startTile + 1 to endTile - 1)
       if (imgMid) {
-        for (let x = startX + 16; x < endX - 16; x += 16) {
-          ctx.drawImage(imgMid, x, screenY);
+        for (let t = startTile + 1; t < endTile; t++) {
+          ctx.drawImage(imgMid, t * 16, drawY);
         }
       }
-      // Right cap
+
+      // Right cap (21px wide, starts at endTile * 16)
       if (imgRight) {
-        ctx.drawImage(imgRight, endX - 16, screenY);
+        ctx.drawImage(imgRight, endTile * 16, drawY);
       }
 
-      // Fallback in case textures are missing
-      if (!imgMid) {
-        ctx.fillStyle = '#5ba4e5';
-        ctx.fillRect(startX, screenY, endX - startX, 16);
-      }
-
-      // Draw milestone floor sign marker on every 10th floor (10, 20, 30...)
+      // Draw milestone floor sign on every 10th floor (FUN_00402780)
       if (floorNum > 0 && floorNum % 10 === 0) {
-        const signImg = this.images.get(floorNum % 50 === 0 ? 'sign04' : 'sign01');
-        const midX = Math.round((startX + endX) / 2);
+        const signImg = this.images.get(`sign0${theme + 1}`) || this.images.get('sign01');
+        // On full-width 50th floors, place the sign near the left wall (x=96); otherwise center on platform
+        const signCenterX = (startTile === 0)
+          ? 110
+          : Math.floor(((startTile + endTile + 1) * 16) / 2);
+        const signY = screenY + 5;
         if (signImg) {
-          ctx.drawImage(signImg, midX - signImg.width / 2, screenY - signImg.height - 2);
+          ctx.drawImage(signImg, Math.floor(signCenterX - signImg.width / 2), signY);
         }
         ctx.save();
-        ctx.font = 'bold 15px "Courier New", monospace';
-        ctx.fillStyle = floorNum % 50 === 0 ? '#ffea00' : '#ffffff';
+        ctx.font = 'bold 12px "Courier New", monospace';
+        ctx.fillStyle = '#ffffff';
         ctx.shadowColor = '#000000';
-        ctx.shadowBlur = 5;
+        ctx.shadowBlur = 3;
         ctx.textAlign = 'center';
-        ctx.fillText(`${floorNum}`, midX, screenY - 8);
+        ctx.fillText(`${floorNum}`, signCenterX, signY + 18);
         ctx.restore();
       }
     }
 
-    // 4. Render Player (Harold the Homeboy)
+    // 4. Render Side Walls AFTER platforms so full-width floors tuck under the walls (FUN_00402780 @ 0x402f5b)
+    if (sideblock) {
+      const wallH = sideblock.height; // 124
+      const wallScroll = (((-camY) % wallH) + wallH) % wallH - wallH;
+
+      // Left Wall: horizontally flipped at x = -57..75 (rounded stone border faces right at x = 75)
+      ctx.save();
+      ctx.translate(75, 0);
+      ctx.scale(-1, 1);
+      for (let y = wallScroll; y < this.GAME_HEIGHT + wallH; y += wallH) {
+        ctx.drawImage(sideblock, 0, y);
+      }
+      ctx.restore();
+
+      // Right Wall: unflipped at x = 565..697 (rounded stone border faces left at x = 565)
+      for (let y = wallScroll; y < this.GAME_HEIGHT + wallH; y += wallH) {
+        ctx.drawImage(sideblock, 565, y);
+      }
+    }
+
+    // 5. Render Player (Harold the Homeboy - exact sprite mapping from FUN_00402780)
     const px = wasm.get_player_x();
     const py = wasm.get_player_y();
     const vx = wasm.get_player_vx();
@@ -300,67 +369,67 @@ export class Renderer {
     const spin = wasm.get_player_spin();
     const onEdge = wasm.get_player_on_edge();
     const animFrame = wasm.get_player_anim_frame();
+    const animTimer = wasm.get_player_anim_timer ? wasm.get_player_anim_timer() : 0;
     const isGameOver = wasm.get_game_over();
 
     let heroSpriteName = 'hero000';
-    if (isGameOver) {
-      heroSpriteName = 'hero012'; // splat
+    if (isGameOver || spin !== 0) {
+      heroSpriteName = 'hero012'; // star-jump / rotation sprite (44x60)
     } else if (state === 0) {
-      if (Math.abs(vx) > 0.3) {
+      if (Math.abs(vx) > 0.25) {
         const runSprites = ['hero001', 'hero002', 'hero003', 'hero004'];
         heroSpriteName = runSprites[animFrame % 4];
       } else if (onEdge) {
-        heroSpriteName = (Math.floor(Date.now() / 200) % 2 === 0) ? 'hero013' : 'hero014';
+        heroSpriteName = (Math.floor(animTimer / 8) % 2 === 0) ? 'hero013' : 'hero014';
       } else {
         heroSpriteName = 'hero000';
       }
-    } else if (state === 1) { // jumping
-      if (vy < -16) {
-        heroSpriteName = 'hero007'; // super jump launch
-      } else if (vy < -8) {
-        heroSpriteName = 'hero006';
+    } else {
+      // Airborne (jumping or falling)
+      if (Math.abs(vx) < 0.25) {
+        // Vertical jump / vertical fall
+        heroSpriteName = vy < 0 ? 'hero008' : 'hero011';
       } else {
-        heroSpriteName = 'hero005';
+        // Diagonal jump / apex / fall
+        if (vy < -3.0) {
+          heroSpriteName = 'hero005';
+        } else if (vy <= 3.0) {
+          heroSpriteName = 'hero006';
+        } else {
+          heroSpriteName = 'hero007';
+        }
       }
-    } else if (state === 2) { // falling
-      if (vy > 6) {
-        heroSpriteName = 'hero009'; // fast plummet
-      } else {
-        heroSpriteName = 'hero008';
-      }
-    }
-
-    // Wall bounce / spin flip
-    if (spin !== 0) {
-      const spinFrames = ['hero010', 'hero011', 'hero000'];
-      heroSpriteName = spinFrames[animFrame % 3];
     }
 
     const heroImg = this.images.get(heroSpriteName) || this.images.get('hero000');
     if (heroImg) {
       const pScreenX = Math.round(px);
-      const pScreenY = Math.round(py - cameraY + 240);
+      const pScreenY = Math.round(py) - camY + 240;
 
       ctx.save();
-      ctx.translate(pScreenX, pScreenY);
-
-      // Spin rotation if in spin mode
       if (spin !== 0) {
-        const spinAngle = (animFrame * 0.45 * spin);
-        ctx.rotate(spinAngle);
+        // Rotate around Harold's torso center
+        ctx.translate(pScreenX, pScreenY - 26);
+        ctx.rotate(spin);
+        if (facing === 0) {
+          ctx.scale(-1, 1);
+        }
+        ctx.drawImage(heroImg, -Math.floor(heroImg.width / 2), -Math.floor(heroImg.height / 2));
+      } else {
+        ctx.translate(pScreenX, pScreenY);
+        if (facing === 0) {
+          ctx.scale(-1, 1);
+        }
+        // Use integer offset (-14 horizontally, -heroImg.height + 1 vertically)
+        // so feet rest solidly on the 3D platform top surface with zero sub-pixel jitter
+        const drawX = onEdge ? -18 : -14;
+        const drawY = -heroImg.height + 1;
+        ctx.drawImage(heroImg, drawX, drawY);
       }
-
-      // Horizontal flip if facing left
-      if (facing === 0) {
-        ctx.scale(-1, 1);
-      }
-
-      // Draw centered horizontally, anchored at bottom foot
-      ctx.drawImage(heroImg, -heroImg.width / 2, -heroImg.height);
       ctx.restore();
     }
 
-    // 5. Render Combo Particles
+    // 6. Render Combo Particles
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const p = this.particles[i];
       p.x += p.vx;
@@ -370,7 +439,7 @@ export class Renderer {
 
       const starImg = this.images.get(`star0${p.spriteIndex}`);
       if (starImg) {
-        const pScreenY = Math.round(p.y - cameraY + 240);
+        const pScreenY = Math.round(p.y) - camY + 240;
         ctx.save();
         ctx.globalAlpha = Math.max(0, 1 - p.life / p.maxLife);
         ctx.drawImage(starImg, Math.round(p.x - starImg.width / 2), Math.round(pScreenY - starImg.height / 2));
