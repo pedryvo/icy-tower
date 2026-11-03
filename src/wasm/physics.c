@@ -117,9 +117,9 @@ static void trigger_sfx(int sfx_flag) {
     g_game.sound_events |= sfx_flag;
 }
 
-// Generate new platforms up to camera view + buffer
+// Generate new platforms up to camera view + buffer (supports tall mobile portrait screens)
 static void generate_platforms_ahead(void) {
-    float target_y = g_game.camera_y - 300.0f;
+    float target_y = g_game.camera_y - 800.0f;
     
     while (1) {
         // Find highest existing platform Y

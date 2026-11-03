@@ -22,6 +22,11 @@ export class Renderer {
   readonly GAME_WIDTH = 640;
   readonly GAME_HEIGHT = 480;
   
+  // Dynamic viewport dimensions in logical pixels (fills 100% height on mobile!)
+  private viewWidth = 640;
+  private viewHeight = 480;
+  private cameraX = 0;
+
   // Scaling and viewport offsets
   private scale = 1;
   private offsetX = 0;
@@ -129,14 +134,25 @@ export class Renderer {
     this.canvas.width = Math.floor(w * dpr);
     this.canvas.height = Math.floor(h * dpr);
 
-    // Compute scale so the 640x480 playfield fits nicely with generous space
-    const scaleX = (w * dpr) / this.GAME_WIDTH;
-    const scaleY = (h * dpr) / this.GAME_HEIGHT;
-    this.scale = Math.min(scaleX, scaleY);
+    const aspect = w / h;
 
-    // Center game viewport inside canvas
-    this.offsetX = Math.floor(((w * dpr) - (this.GAME_WIDTH * this.scale)) / 2);
-    this.offsetY = Math.floor(((h * dpr) - (this.GAME_HEIGHT * this.scale)) / 2);
+    if (aspect >= this.GAME_WIDTH / this.GAME_HEIGHT) {
+      // Desktop / Landscape: fit 100% of screen height (480 logical px tall)
+      this.viewHeight = this.GAME_HEIGHT;
+      this.viewWidth = this.GAME_WIDTH;
+      this.scale = (h * dpr) / this.GAME_HEIGHT;
+      this.offsetX = Math.floor(((w * dpr) - (this.GAME_WIDTH * this.scale)) / 2);
+      this.offsetY = 0;
+    } else {
+      // Mobile / Portrait / Narrow screen:
+      // Eliminate 4:3 letterboxing! Zoom in so character & platforms are >2x larger
+      // and extend viewHeight to occupy 100% of the vertical screen height.
+      this.viewWidth = Math.min(this.GAME_WIDTH, Math.max(300, Math.round(520 * aspect)));
+      this.scale = (w * dpr) / this.viewWidth;
+      this.viewHeight = Math.max(this.GAME_HEIGHT, Math.round((h * dpr) / this.scale));
+      this.offsetX = 0;
+      this.offsetY = 0;
+    }
 
     this.ctx.imageSmoothingEnabled = false;
   }
@@ -232,9 +248,50 @@ export class Renderer {
 
     // Single integer camera Y per frame to prevent any sub-pixel jitter between platforms and player
     const camY = Math.round(wasm.get_camera_y());
+    const px = wasm.get_player_x();
+    const py = wasm.get_player_y();
+    const isNarrow = this.viewWidth < this.GAME_WIDTH;
+
+    // Vertical anchor: on tall mobile portrait screens, anchor Floor 0 above the touch controls
+    // while showing all upper floors up to the very top of the screen (100% height)
+    const anchorY = this.viewHeight > 500 ? this.viewHeight - 285 : 240;
+
+    // Horizontal camera follow on mobile portrait / narrow screens
+    if (!isNarrow) {
+      this.cameraX = 0;
+    } else {
+      // Find next platform slightly above player to gently bias look-ahead
+      let lookTargetX = px;
+      const platCount = wasm.get_platform_count();
+      let bestDy = 9999;
+      for (let i = 0; i < platCount; i++) {
+        if (!wasm.get_platform_active(i)) continue;
+        const pY = wasm.get_platform_y(i);
+        const dy = py - pY;
+        if (dy > 10 && dy < 120 && dy < bestDy) {
+          const st = wasm.get_platform_start(i);
+          const en = wasm.get_platform_end(i);
+          if (st > 0) {
+            bestDy = dy;
+            const platCenterX = ((st + en + 1) * 16) / 2;
+            lookTargetX = px * 0.72 + platCenterX * 0.28;
+          }
+        }
+      }
+      const desiredCamX = lookTargetX - this.viewWidth / 2;
+      const minCamX = Math.max(0, 50);
+      const maxCamX = Math.max(minCamX, 590 - this.viewWidth);
+      const clampedTarget = Math.max(minCamX, Math.min(maxCamX, desiredCamX));
+      if (this.cameraX === 0) {
+        this.cameraX = clampedTarget;
+      } else {
+        this.cameraX += (clampedTarget - this.cameraX) * 0.18;
+      }
+    }
+    const camX = Math.round(this.cameraX);
 
     // 1. Fill outer widescreen backdrop with darkened staggered tower bricks
-    if (bgtile) {
+    if (bgtile && this.offsetX > 0) {
       const bgW = Math.max(1, Math.round(bgtile.width * this.scale));
       const bgH = Math.max(1, Math.round(bgtile.height * this.scale));
       const rawScroll = Math.round(-camY * 0.5 * this.scale) % (bgH * 2);
@@ -254,21 +311,25 @@ export class Renderer {
       ctx.restore();
     }
 
-    // 2. Setup 640x480 logical game view transformation
+    // 2. Setup logical game viewport transformation (occupies 100% height on mobile & desktop)
     ctx.save();
     ctx.translate(this.offsetX, this.offsetY);
     ctx.scale(this.scale, this.scale);
 
-    // Clip to logical 640x480 playfield so side walls (-57..75 and 565..697) have clean outer edges
+    // Clip to logical viewport
     ctx.beginPath();
-    ctx.rect(0, 0, this.GAME_WIDTH, this.GAME_HEIGHT);
+    ctx.rect(0, 0, this.viewWidth, this.viewHeight);
     ctx.clip();
 
-    // 2a. Render authentic 3D cylindrical brick background (FUN_00401db0)
+    // 2a. World-space layer (panned by -camX on mobile portrait)
+    ctx.save();
+    ctx.translate(-camX, 0);
+
+    // Render authentic 3D cylindrical brick background (FUN_00401db0) across full viewHeight
     if (this.cylindricalBg) {
       const cylH = 64;
       const bgScroll = (((-Math.floor(camY * 0.5)) % cylH) + cylH) % cylH - cylH;
-      for (let y = bgScroll; y < this.GAME_HEIGHT + cylH; y += cylH) {
+      for (let y = bgScroll; y < this.viewHeight + cylH; y += cylH) {
         ctx.drawImage(this.cylindricalBg, 0, y);
       }
     }
@@ -279,8 +340,8 @@ export class Renderer {
       if (!wasm.get_platform_active(i)) continue;
 
       const platY = wasm.get_platform_y(i);
-      const screenY = Math.round(platY) - camY + 240;
-      if (screenY < -50 || screenY > this.GAME_HEIGHT + 50) continue;
+      const screenY = Math.round(platY) - camY + anchorY;
+      if (screenY < -50 || screenY > this.viewHeight + 50) continue;
 
       const startTile = wasm.get_platform_start(i);
       const endTile = wasm.get_platform_end(i);
@@ -320,9 +381,9 @@ export class Renderer {
       // Draw milestone floor sign on every 10th floor (FUN_00402780)
       if (floorNum > 0 && floorNum % 10 === 0) {
         const signImg = this.images.get(`sign0${theme + 1}`) || this.images.get('sign01');
-        // On full-width 50th floors, place the sign near the left wall (x=96); otherwise center on platform
+        // On full-width 50th floors, place the sign near the center/left so it's always visible
         const signCenterX = (startTile === 0)
-          ? 110
+          ? 200
           : Math.floor(((startTile + endTile + 1) * 16) / 2);
         const signY = screenY + 5;
         if (signImg) {
@@ -348,20 +409,18 @@ export class Renderer {
       ctx.save();
       ctx.translate(75, 0);
       ctx.scale(-1, 1);
-      for (let y = wallScroll; y < this.GAME_HEIGHT + wallH; y += wallH) {
+      for (let y = wallScroll; y < this.viewHeight + wallH; y += wallH) {
         ctx.drawImage(sideblock, 0, y);
       }
       ctx.restore();
 
       // Right Wall: unflipped at x = 565..697 (rounded stone border faces left at x = 565)
-      for (let y = wallScroll; y < this.GAME_HEIGHT + wallH; y += wallH) {
+      for (let y = wallScroll; y < this.viewHeight + wallH; y += wallH) {
         ctx.drawImage(sideblock, 565, y);
       }
     }
 
     // 5. Render Player (Harold the Homeboy - exact sprite mapping from FUN_00402780)
-    const px = wasm.get_player_x();
-    const py = wasm.get_player_y();
     const vx = wasm.get_player_vx();
     const vy = wasm.get_player_vy();
     const state = wasm.get_player_state(); // 0: ground, 1: jump, 2: fall
@@ -404,7 +463,7 @@ export class Renderer {
     const heroImg = this.images.get(heroSpriteName) || this.images.get('hero000');
     if (heroImg) {
       const pScreenX = Math.round(px);
-      const pScreenY = Math.round(py) - camY + 240;
+      const pScreenY = Math.round(py) - camY + anchorY;
 
       ctx.save();
       if (spin !== 0) {
@@ -429,7 +488,7 @@ export class Renderer {
       ctx.restore();
     }
 
-    // 6. Render Combo Particles
+    // 6. Render Combo Particles (world-space)
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const p = this.particles[i];
       p.x += p.vx;
@@ -439,7 +498,7 @@ export class Renderer {
 
       const starImg = this.images.get(`star0${p.spriteIndex}`);
       if (starImg) {
-        const pScreenY = Math.round(p.y) - camY + 240;
+        const pScreenY = Math.round(p.y) - camY + anchorY;
         ctx.save();
         ctx.globalAlpha = Math.max(0, 1 - p.life / p.maxLife);
         ctx.drawImage(starImg, Math.round(p.x - starImg.width / 2), Math.round(pScreenY - starImg.height / 2));
@@ -451,7 +510,9 @@ export class Renderer {
       }
     }
 
-    // 6. Combo Meter & Liquid (Left HUD)
+    ctx.restore(); // End world-space (-camX) layer; now in viewport-space (0..viewWidth, 0..viewHeight)
+
+    // 7. Combo Meter & Liquid (Left HUD)
     const comboMeter = this.images.get('combo_meter');
     const comboLiquid = this.images.get('combo_liquid');
     const comboCount = this.images.get('combo_count');
@@ -459,9 +520,14 @@ export class Renderer {
     const comboFloors = wasm.get_combo_floors();
 
     if (comboMeter) {
-      const meterX = 14;
-      const meterY = 140;
-      ctx.drawImage(comboMeter, meterX, meterY);
+      const meterX = isNarrow ? 6 : 14;
+      const meterY = isNarrow ? 105 : 140;
+      const meterScale = isNarrow ? 0.78 : 1;
+
+      ctx.save();
+      ctx.translate(meterX, meterY);
+      ctx.scale(meterScale, meterScale);
+      ctx.drawImage(comboMeter, 0, 0);
 
       if (comboTimer > 0 && comboLiquid) {
         const fillHeight = (comboTimer / 100) * comboLiquid.height;
@@ -469,52 +535,57 @@ export class Renderer {
         ctx.drawImage(
           comboLiquid,
           0, sourceY, comboLiquid.width, fillHeight,
-          meterX + 16, meterY + 12 + sourceY, comboLiquid.width, fillHeight
+          16, 12 + sourceY, comboLiquid.width, fillHeight
         );
       }
 
       if (comboFloors >= 2 && comboCount) {
-        ctx.drawImage(comboCount, meterX + 4, meterY - 45);
-        ctx.save();
+        ctx.drawImage(comboCount, 4, -45);
         ctx.font = 'bold 22px monospace';
         ctx.fillStyle = '#ffec40';
         ctx.shadowColor = '#d94000';
         ctx.shadowBlur = 6;
         ctx.textAlign = 'center';
-        ctx.fillText(`x${comboFloors}`, meterX + 30, meterY - 14);
-        ctx.restore();
+        ctx.fillText(`x${comboFloors}`, 30, -14);
       }
+      ctx.restore();
     }
 
-    // 7. Hurry Up Clock (Top-left HUD)
+    // 8. Hurry Up Clock (Top-left HUD)
     const clockImg = this.images.get('clock');
     const clockHand = this.images.get('clock_hand');
     if (clockImg && clockHand) {
-      const clockX = 12;
-      const clockY = 12;
-      ctx.drawImage(clockImg, clockX, clockY);
+      const clockScale = isNarrow ? 0.56 : 1;
+      const clockX = isNarrow ? 6 : 12;
+      const clockY = isNarrow ? 42 : 12;
+
+      ctx.save();
+      ctx.translate(clockX, clockY);
+      ctx.scale(clockScale, clockScale);
+      ctx.drawImage(clockImg, 0, 0);
 
       const clockTimer = wasm.get_clock_timer();
       const angle = (clockTimer * 0.04) % (Math.PI * 2);
-      ctx.save();
-      ctx.translate(clockX + clockImg.width / 2, clockY + clockImg.height / 2);
+      ctx.translate(clockImg.width / 2, clockImg.height / 2);
       ctx.rotate(angle);
       ctx.drawImage(clockHand, -clockHand.width / 2, -clockHand.height + 6);
       ctx.restore();
     }
 
-    // 8. Combo Celebration Banner (Center Screen)
+    // 9. Combo Celebration Banner (Center Screen)
     const bannerType = wasm.get_combo_banner_type();
     const bannerTimer = wasm.get_combo_banner_timer();
     if (bannerType >= 0 && bannerTimer > 0) {
       const bannerImg = this.images.get(`reware00${bannerType}`);
       if (bannerImg) {
         ctx.save();
-        const scaleFactor = bannerTimer > 70 ? 1 + (bannerTimer - 70) * 0.03 : 1;
+        const maxBannerW = this.viewWidth * 0.82;
+        const baseScale = Math.min(1, maxBannerW / bannerImg.width);
+        const scaleFactor = (bannerTimer > 70 ? 1 + (bannerTimer - 70) * 0.03 : 1) * baseScale;
         const bannerW = bannerImg.width * scaleFactor;
         const bannerH = bannerImg.height * scaleFactor;
-        const bx = (this.GAME_WIDTH - bannerW) / 2;
-        const by = 180 - bannerH / 2;
+        const bx = (this.viewWidth - bannerW) / 2;
+        const by = this.viewHeight * 0.34 - bannerH / 2;
 
         ctx.shadowColor = '#ffe040';
         ctx.shadowBlur = 15;
@@ -523,108 +594,168 @@ export class Renderer {
       }
     }
 
-    // 9. REFINED RETRO ARCADE HUD (Andar / Pontos / Recorde)
+    // 10. REFINED RETRO ARCADE HUD (Andar / Pontos / Recorde)
     const currentFloor = wasm.get_current_floor();
     const score = wasm.get_score();
 
-    // Floor Badge (ANDAR / FLOOR)
-    this.drawRoundedBadge(
-      112, 12, 138, 56, 8,
-      'rgba(24, 20, 8, 0.90)', 'rgba(12, 10, 4, 0.95)',
-      '#f5b800', 'rgba(245, 184, 0, 0.45)'
-    );
+    if (isNarrow) {
+      // Compact mobile HUD layout (fits 100% inside narrow portrait width right below top-right controls)
+      const hudStartX = 62;
+      const hudY = 44;
+      const hudH = 44;
+      const gap = 5;
+      const availW = this.viewWidth - hudStartX - 6;
+      const badgeW = Math.floor((availW - gap * 2) / 3);
 
-    ctx.save();
-    // Label
-    ctx.font = '900 11px sans-serif';
-    ctx.fillStyle = '#ffcf33';
-    ctx.shadowColor = '#000000';
-    ctx.shadowBlur = 3;
-    ctx.textAlign = 'center';
-    ctx.fillText(`▲ ${t.floor.toUpperCase()}`, 112 + 138 / 2, 28);
+      // Floor Badge
+      const fx = hudStartX;
+      this.drawRoundedBadge(
+        fx, hudY, badgeW, hudH, 6,
+        'rgba(24, 20, 8, 0.90)', 'rgba(12, 10, 4, 0.95)',
+        '#f5b800', 'rgba(245, 184, 0, 0.4)'
+      );
+      ctx.save();
+      ctx.font = '900 9px sans-serif';
+      ctx.fillStyle = '#ffcf33';
+      ctx.textAlign = 'center';
+      ctx.fillText(`▲ ${t.floor.toUpperCase()}`, fx + badgeW / 2, hudY + 14);
+      ctx.font = '900 16px "Courier New", monospace';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(`${currentFloor}`, fx + badgeW / 2, hudY + 35);
+      ctx.restore();
 
-    // Number
-    ctx.font = '900 24px "Courier New", monospace';
-    ctx.fillStyle = '#ffffff';
-    ctx.shadowColor = '#e69500';
-    ctx.shadowBlur = 6;
-    ctx.fillText(`${currentFloor}`, 112 + 138 / 2, 55);
-    ctx.restore();
+      // Score Badge
+      const sx = fx + badgeW + gap;
+      this.drawRoundedBadge(
+        sx, hudY, badgeW, hudH, 6,
+        'rgba(6, 22, 28, 0.90)', 'rgba(3, 12, 16, 0.95)',
+        '#00d4e6', 'rgba(0, 212, 230, 0.4)'
+      );
+      ctx.save();
+      ctx.font = '900 9px sans-serif';
+      ctx.fillStyle = '#00e5ff';
+      ctx.textAlign = 'center';
+      ctx.fillText(`★ ${t.score.toUpperCase()}`, sx + badgeW / 2, hudY + 14);
+      ctx.font = '900 15px "Courier New", monospace';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(`${score.toLocaleString()}`, sx + badgeW / 2, hudY + 35);
+      ctx.restore();
 
-    // Score Badge (PONTOS / SCORE)
-    this.drawRoundedBadge(
-      260, 12, 155, 56, 8,
-      'rgba(6, 22, 28, 0.90)', 'rgba(3, 12, 16, 0.95)',
-      '#00d4e6', 'rgba(0, 212, 230, 0.45)'
-    );
+      // Best Badge
+      const bx = sx + badgeW + gap;
+      this.drawRoundedBadge(
+        bx, hudY, badgeW, hudH, 6,
+        'rgba(26, 12, 26, 0.90)', 'rgba(14, 6, 14, 0.95)',
+        '#e056b3', 'rgba(224, 86, 179, 0.4)'
+      );
+      ctx.save();
+      ctx.font = '900 9px sans-serif';
+      ctx.fillStyle = '#ff78c8';
+      ctx.textAlign = 'center';
+      ctx.fillText(`👑 ${t.best.toUpperCase()}`, bx + badgeW / 2, hudY + 14);
+      ctx.font = '900 14px "Courier New", monospace';
+      ctx.fillStyle = '#ffe8f5';
+      ctx.fillText(`${Math.max(highScore, score).toLocaleString()}`, bx + badgeW / 2, hudY + 35);
+      ctx.restore();
+    } else {
+      // Desktop HUD Badges
+      this.drawRoundedBadge(
+        112, 12, 138, 56, 8,
+        'rgba(24, 20, 8, 0.90)', 'rgba(12, 10, 4, 0.95)',
+        '#f5b800', 'rgba(245, 184, 0, 0.45)'
+      );
 
-    ctx.save();
-    // Label
-    ctx.font = '900 11px sans-serif';
-    ctx.fillStyle = '#00e5ff';
-    ctx.shadowColor = '#000000';
-    ctx.shadowBlur = 3;
-    ctx.textAlign = 'center';
-    ctx.fillText(`★ ${t.score.toUpperCase()}`, 260 + 155 / 2, 28);
+      ctx.save();
+      ctx.font = '900 11px sans-serif';
+      ctx.fillStyle = '#ffcf33';
+      ctx.shadowColor = '#000000';
+      ctx.shadowBlur = 3;
+      ctx.textAlign = 'center';
+      ctx.fillText(`▲ ${t.floor.toUpperCase()}`, 112 + 138 / 2, 28);
 
-    // Number
-    ctx.font = '900 22px "Courier New", monospace';
-    ctx.fillStyle = '#ffffff';
-    ctx.shadowColor = '#008cb3';
-    ctx.shadowBlur = 6;
-    ctx.fillText(`${score.toLocaleString()}`, 260 + 155 / 2, 55);
-    ctx.restore();
+      ctx.font = '900 24px "Courier New", monospace';
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = '#e69500';
+      ctx.shadowBlur = 6;
+      ctx.fillText(`${currentFloor}`, 112 + 138 / 2, 55);
+      ctx.restore();
 
-    // Best Record Badge (RECORDE / BEST)
-    this.drawRoundedBadge(
-      425, 12, 125, 56, 8,
-      'rgba(26, 12, 26, 0.90)', 'rgba(14, 6, 14, 0.95)',
-      '#e056b3', 'rgba(224, 86, 179, 0.45)'
-    );
+      this.drawRoundedBadge(
+        260, 12, 155, 56, 8,
+        'rgba(6, 22, 28, 0.90)', 'rgba(3, 12, 16, 0.95)',
+        '#00d4e6', 'rgba(0, 212, 230, 0.45)'
+      );
 
-    ctx.save();
-    // Label
-    ctx.font = '900 11px sans-serif';
-    ctx.fillStyle = '#ff78c8';
-    ctx.shadowColor = '#000000';
-    ctx.shadowBlur = 3;
-    ctx.textAlign = 'center';
-    ctx.fillText(`👑 ${t.best.toUpperCase()}`, 425 + 125 / 2, 28);
+      ctx.save();
+      ctx.font = '900 11px sans-serif';
+      ctx.fillStyle = '#00e5ff';
+      ctx.shadowColor = '#000000';
+      ctx.shadowBlur = 3;
+      ctx.textAlign = 'center';
+      ctx.fillText(`★ ${t.score.toUpperCase()}`, 260 + 155 / 2, 28);
 
-    // Number
-    ctx.font = '900 19px "Courier New", monospace';
-    ctx.fillStyle = '#ffe8f5';
-    ctx.shadowColor = '#aa2277';
-    ctx.shadowBlur = 6;
-    ctx.fillText(`${Math.max(highScore, score).toLocaleString()}`, 425 + 125 / 2, 54);
-    ctx.restore();
+      ctx.font = '900 22px "Courier New", monospace';
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = '#008cb3';
+      ctx.shadowBlur = 6;
+      ctx.fillText(`${score.toLocaleString()}`, 260 + 155 / 2, 55);
+      ctx.restore();
 
-    // 10. Title Screen Overlay
+      this.drawRoundedBadge(
+        425, 12, 125, 56, 8,
+        'rgba(26, 12, 26, 0.90)', 'rgba(14, 6, 14, 0.95)',
+        '#e056b3', 'rgba(224, 86, 179, 0.45)'
+      );
+
+      ctx.save();
+      ctx.font = '900 11px sans-serif';
+      ctx.fillStyle = '#ff78c8';
+      ctx.shadowColor = '#000000';
+      ctx.shadowBlur = 3;
+      ctx.textAlign = 'center';
+      ctx.fillText(`👑 ${t.best.toUpperCase()}`, 425 + 125 / 2, 28);
+
+      ctx.font = '900 19px "Courier New", monospace';
+      ctx.fillStyle = '#ffe8f5';
+      ctx.shadowColor = '#aa2277';
+      ctx.shadowBlur = 6;
+      ctx.fillText(`${Math.max(highScore, score).toLocaleString()}`, 425 + 125 / 2, 54);
+      ctx.restore();
+    }
+
+    // 11. Title Screen Overlay
     if (gameState === 'title') {
       const titleImg = this.images.get('title');
 
       ctx.save();
       ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
-      ctx.fillRect(0, 0, this.GAME_WIDTH, this.GAME_HEIGHT);
+      ctx.fillRect(0, 0, this.viewWidth, this.viewHeight);
+
+      const centerY = Math.floor(this.viewHeight * 0.42);
 
       if (titleImg) {
-        ctx.drawImage(titleImg, (this.GAME_WIDTH - titleImg.width) / 2, 60);
+        const maxLogoW = this.viewWidth - 24;
+        const logoScale = Math.min(1, maxLogoW / titleImg.width);
+        const lw = Math.round(titleImg.width * logoScale);
+        const lh = Math.round(titleImg.height * logoScale);
+        ctx.drawImage(titleImg, Math.round((this.viewWidth - lw) / 2), Math.max(80, centerY - lh - 10), lw, lh);
       }
 
       // Best Score Banner on Title
       if (highScore > 0) {
+        const bw = Math.min(240, this.viewWidth - 32);
         this.drawRoundedBadge(
-          (this.GAME_WIDTH - 240) / 2, 280, 240, 44, 8,
+          (this.viewWidth - bw) / 2, centerY + 10, bw, 40, 8,
           'rgba(26, 12, 26, 0.92)', 'rgba(14, 6, 14, 0.95)',
           '#e056b3', 'rgba(224, 86, 179, 0.5)'
         );
-        ctx.font = 'bold 16px "Courier New", monospace';
+        ctx.font = 'bold 14px "Courier New", monospace';
         ctx.fillStyle = '#ffd6f0';
         ctx.textAlign = 'center';
-        ctx.fillText(`👑 ${t.best.toUpperCase()}: ${highScore.toLocaleString()}`, this.GAME_WIDTH / 2, 308);
+        ctx.fillText(`👑 ${t.best.toUpperCase()}: ${highScore.toLocaleString()}`, this.viewWidth / 2, centerY + 35);
       }
 
-      ctx.font = 'bold 22px "Courier New", monospace';
+      ctx.font = `bold ${isNarrow ? 15 : 22}px "Courier New", monospace`;
       ctx.fillStyle = '#ffe040';
       ctx.shadowColor = '#d94000';
       ctx.shadowBlur = 8;
@@ -632,32 +763,38 @@ export class Renderer {
       
       const blink = Math.floor(Date.now() / 400) % 2 === 0;
       if (blink) {
-        ctx.fillText(t.pressKeyToStart, this.GAME_WIDTH / 2, 370);
+        ctx.fillText(t.pressKeyToStart, this.viewWidth / 2, centerY + 85);
       }
 
-      ctx.font = '13px monospace';
+      ctx.font = `${isNarrow ? 10 : 13}px monospace`;
       ctx.fillStyle = '#a0d0ff';
       ctx.shadowBlur = 2;
-      ctx.fillText(t.mobileControlsPrompt, this.GAME_WIDTH / 2, 420);
+      ctx.fillText(t.mobileControlsPrompt, this.viewWidth / 2, centerY + 120);
       ctx.restore();
     }
 
-    // 11. Game Over Overlay
+    // 12. Game Over Overlay
     if (gameState === 'gameover' || isGameOver) {
       const gameOverImg = this.images.get('gameover');
       ctx.save();
       ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
-      ctx.fillRect(0, 0, this.GAME_WIDTH, this.GAME_HEIGHT);
+      ctx.fillRect(0, 0, this.viewWidth, this.viewHeight);
+
+      const centerY = Math.floor(this.viewHeight * 0.44);
 
       if (gameOverImg) {
-        ctx.drawImage(gameOverImg, (this.GAME_WIDTH - gameOverImg.width) / 2, 70);
+        const maxGoW = this.viewWidth - 28;
+        const goScale = Math.min(1, maxGoW / gameOverImg.width);
+        const gw = Math.round(gameOverImg.width * goScale);
+        const gh = Math.round(gameOverImg.height * goScale);
+        ctx.drawImage(gameOverImg, Math.round((this.viewWidth - gw) / 2), Math.max(70, centerY - gh - 25), gw, gh);
       }
 
       // Summary Card
-      const cardW = 320;
-      const cardH = 140;
-      const cardX = (this.GAME_WIDTH - cardW) / 2;
-      const cardY = 200;
+      const cardW = Math.min(320, this.viewWidth - 28);
+      const cardH = 135;
+      const cardX = (this.viewWidth - cardW) / 2;
+      const cardY = centerY - 10;
       this.drawRoundedBadge(
         cardX, cardY, cardW, cardH, 12,
         'rgba(16, 18, 32, 0.95)', 'rgba(8, 9, 18, 0.98)',
@@ -665,48 +802,48 @@ export class Renderer {
       );
 
       ctx.textAlign = 'center';
-      ctx.font = 'bold 20px "Courier New", monospace';
+      ctx.font = `bold ${isNarrow ? 17 : 20}px "Courier New", monospace`;
       ctx.fillStyle = '#ffffff';
-      ctx.fillText(`${t.floor}: ${currentFloor}`, this.GAME_WIDTH / 2, cardY + 45);
-      ctx.fillText(`${t.score}: ${score.toLocaleString()}`, this.GAME_WIDTH / 2, cardY + 80);
+      ctx.fillText(`${t.floor}: ${currentFloor}`, this.viewWidth / 2, cardY + 42);
+      ctx.fillText(`${t.score}: ${score.toLocaleString()}`, this.viewWidth / 2, cardY + 76);
 
       if (score >= highScore && score > 0) {
-        ctx.font = 'bold 15px "Courier New", monospace';
+        ctx.font = `bold ${isNarrow ? 12 : 15}px "Courier New", monospace`;
         ctx.fillStyle = '#ff78c8';
-        ctx.fillText(`🎉 NEW RECORD / NOVO RECORDE! 🎉`, this.GAME_WIDTH / 2, cardY + 115);
+        ctx.fillText(`🎉 NEW RECORD / NOVO RECORDE! 🎉`, this.viewWidth / 2, cardY + 112);
       } else {
         ctx.font = '14px "Courier New", monospace';
         ctx.fillStyle = '#a0c0e0';
-        ctx.fillText(`${t.best}: ${highScore.toLocaleString()}`, this.GAME_WIDTH / 2, cardY + 115);
+        ctx.fillText(`${t.best}: ${highScore.toLocaleString()}`, this.viewWidth / 2, cardY + 112);
       }
 
-      ctx.font = 'bold 22px "Courier New", monospace';
+      ctx.font = `bold ${isNarrow ? 15 : 22}px "Courier New", monospace`;
       ctx.fillStyle = '#ffe040';
       ctx.shadowColor = '#ff4000';
       ctx.shadowBlur = 8;
       const blink = Math.floor(Date.now() / 350) % 2 === 0;
       if (blink) {
-        ctx.fillText(t.restart, this.GAME_WIDTH / 2, 385);
+        ctx.fillText(t.restart, this.viewWidth / 2, cardY + 170);
       }
       ctx.restore();
     }
 
-    // 12. Paused Overlay
+    // 13. Paused Overlay
     if (gameState === 'paused') {
       ctx.save();
       ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
-      ctx.fillRect(0, 0, this.GAME_WIDTH, this.GAME_HEIGHT);
+      ctx.fillRect(0, 0, this.viewWidth, this.viewHeight);
 
-      ctx.font = 'bold 36px monospace';
+      ctx.font = `bold ${isNarrow ? 28 : 36}px monospace`;
       ctx.fillStyle = '#ffe040';
       ctx.shadowColor = '#000000';
       ctx.shadowBlur = 10;
       ctx.textAlign = 'center';
-      ctx.fillText(t.pause, this.GAME_WIDTH / 2, 220);
+      ctx.fillText(t.pause, this.viewWidth / 2, this.viewHeight * 0.44);
 
-      ctx.font = '18px monospace';
+      ctx.font = `${isNarrow ? 14 : 18}px monospace`;
       ctx.fillStyle = '#ffffff';
-      ctx.fillText(t.resume, this.GAME_WIDTH / 2, 270);
+      ctx.fillText(t.resume, this.viewWidth / 2, this.viewHeight * 0.44 + 45);
       ctx.restore();
     }
 
