@@ -1,5 +1,6 @@
 export class SoundManager {
   private ctx: AudioContext | null = null;
+  private compressor: DynamicsCompressorNode | null = null;
   private masterGain: GainNode | null = null;
   private musicGain: GainNode | null = null;
   private sfxGain: GainNode | null = null;
@@ -10,33 +11,35 @@ export class SoundManager {
   private pendingMusicName: string | null = null;
   private isMuted: boolean = false;
   private isLoaded: boolean = false;
+  private lastSfxTimes: Map<string, number> = new Map();
 
+  // All sounds converted to standard 44.1 kHz web-friendly MP3
   private soundFiles: Record<string, string> = {
-    aight: '/sfx/aight.wav',
-    amazing: '/sfx/amazing.wav',
-    bg_beat: '/sfx/bg_beat.wav',
-    bg_menu: '/sfx/bg_menu.wav',
-    cheer: '/sfx/cheer.wav',
-    edge: '/sfx/edge.wav',
-    extreme: '/sfx/extreme.wav',
-    falling: '/sfx/falling.wav',
-    gameover: '/sfx/gameover.wav',
-    good: '/sfx/good.wav',
-    great: '/sfx/great.wav',
-    hurryup: '/sfx/hurryup.wav',
-    jump_hi: '/sfx/jump_hi.wav',
-    jump_lo: '/sfx/jump_lo.wav',
-    jump_mid: '/sfx/jump_mid.wav',
-    menu_change: '/sfx/menu_change.wav',
-    menu_choose: '/sfx/menu_choose.wav',
-    ring: '/sfx/ring.wav',
-    splat: '/sfx/splat.wav',
-    step: '/sfx/step.wav',
-    sweet: '/sfx/sweet.wav',
-    tryagain: '/sfx/tryagain.wav',
-    wazup: '/sfx/wazup.wav',
-    wow: '/sfx/wow.wav',
-    yo: '/sfx/yo.wav',
+    aight: '/sfx/aight.mp3',
+    amazing: '/sfx/amazing.mp3',
+    bg_beat: '/sfx/bg_beat.mp3',
+    bg_menu: '/sfx/bg_menu.mp3',
+    cheer: '/sfx/cheer.mp3',
+    edge: '/sfx/edge.mp3',
+    extreme: '/sfx/extreme.mp3',
+    falling: '/sfx/falling.mp3',
+    gameover: '/sfx/gameover.mp3',
+    good: '/sfx/good.mp3',
+    great: '/sfx/great.mp3',
+    hurryup: '/sfx/hurryup.mp3',
+    jump_hi: '/sfx/jump_hi.mp3',
+    jump_lo: '/sfx/jump_lo.mp3',
+    jump_mid: '/sfx/jump_mid.mp3',
+    menu_change: '/sfx/menu_change.mp3',
+    menu_choose: '/sfx/menu_choose.mp3',
+    ring: '/sfx/ring.mp3',
+    splat: '/sfx/splat.mp3',
+    step: '/sfx/step.mp3',
+    sweet: '/sfx/sweet.mp3',
+    tryagain: '/sfx/tryagain.mp3',
+    wazup: '/sfx/wazup.mp3',
+    wow: '/sfx/wow.mp3',
+    yo: '/sfx/yo.mp3',
   };
 
   constructor() {
@@ -48,17 +51,28 @@ export class SoundManager {
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       if (AudioCtx) {
         this.ctx = new AudioCtx();
+        
+        // Anti-clipping dynamics compressor
+        this.compressor = this.ctx.createDynamicsCompressor();
+        this.compressor.threshold.setValueAtTime(-12, this.ctx.currentTime);
+        this.compressor.knee.setValueAtTime(8, this.ctx.currentTime);
+        this.compressor.ratio.setValueAtTime(8, this.ctx.currentTime);
+        this.compressor.attack.setValueAtTime(0.003, this.ctx.currentTime);
+        this.compressor.release.setValueAtTime(0.2, this.ctx.currentTime);
+
         this.masterGain = this.ctx.createGain();
         this.musicGain = this.ctx.createGain();
         this.sfxGain = this.ctx.createGain();
 
-        this.musicGain.gain.value = 0.75;
-        this.sfxGain.gain.value = 0.85;
-        this.masterGain.gain.value = 1.0;
+        // Balanced volumes to prevent digital clipping
+        this.musicGain.gain.setValueAtTime(0.40, this.ctx.currentTime);
+        this.sfxGain.gain.setValueAtTime(0.60, this.ctx.currentTime);
+        this.masterGain.gain.setValueAtTime(0.85, this.ctx.currentTime);
 
         this.musicGain.connect(this.masterGain);
         this.sfxGain.connect(this.masterGain);
-        this.masterGain.connect(this.ctx.destination);
+        this.masterGain.connect(this.compressor);
+        this.compressor.connect(this.ctx.destination);
       }
     }
     return this.ctx;
@@ -122,6 +136,14 @@ export class SoundManager {
       ctx.resume().catch(() => {});
     }
 
+    // Rate-limit identical SFX triggers to prevent harsh constructive interference / phasing distortion
+    const now = performance.now();
+    const lastTime = this.lastSfxTimes.get(name) || 0;
+    if (now - lastTime < 50) {
+      return;
+    }
+    this.lastSfxTimes.set(name, now);
+
     const buffer = this.buffers.get(name);
     if (!buffer) return;
 
@@ -129,7 +151,7 @@ export class SoundManager {
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       const gain = ctx.createGain();
-      gain.gain.value = volumeScale;
+      gain.gain.value = Math.min(volumeScale, 1.0);
       source.connect(gain);
       gain.connect(this.sfxGain);
       source.start(0);
@@ -197,7 +219,7 @@ export class SoundManager {
   toggleMute(): boolean {
     this.isMuted = !this.isMuted;
     if (this.masterGain && this.ctx) {
-      this.masterGain.gain.setValueAtTime(this.isMuted ? 0 : 1.0, this.ctx.currentTime);
+      this.masterGain.gain.setValueAtTime(this.isMuted ? 0 : 0.85, this.ctx.currentTime);
     }
     if (this.isMuted) {
       this.stopMusic();

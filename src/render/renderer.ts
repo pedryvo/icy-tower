@@ -240,16 +240,13 @@ export class Renderer {
       const floorType = wasm.get_platform_type(i);
       const floorNum = wasm.get_platform_floor(i);
 
-      // Floor texture indexing: 1..12
-      const texIndex = ((floorType - 1) % 12) + 1;
+      // Floor texture indexing: 1..12 (floorType is 0-indexed: 0..11)
+      const texIndex = (Math.abs(floorType) % 12) + 1;
       const pad = texIndex < 10 ? `0${texIndex}` : `${texIndex}`;
-      const leftName = `floor${pad}`;
-      const midName = `floor${pad}`;
-      const rightName = `floor${pad}`;
-
-      const imgLeft = this.images.get(leftName);
-      const imgMid = this.images.get(midName);
-      const imgRight = this.images.get(rightName);
+      const defaultFloor = this.images.get('floor01');
+      const imgLeft = this.images.get(`floor${pad}`) || defaultFloor;
+      const imgMid = this.images.get(`floor${pad}`) || defaultFloor;
+      const imgRight = this.images.get(`floor${pad}`) || defaultFloor;
 
       const startX = startTile * 16;
       const endX = endTile * 16;
@@ -267,6 +264,12 @@ export class Renderer {
       // Right cap
       if (imgRight) {
         ctx.drawImage(imgRight, endX - 16, screenY);
+      }
+
+      // Fallback in case textures are missing
+      if (!imgMid) {
+        ctx.fillStyle = '#5ba4e5';
+        ctx.fillRect(startX, screenY, endX - startX, 16);
       }
 
       // Draw milestone floor sign marker on every 10th floor (10, 20, 30...)
